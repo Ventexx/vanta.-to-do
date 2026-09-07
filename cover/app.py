@@ -575,14 +575,16 @@ QWidget#browserStatusBar {
 QToolButton#browserSettingsBtn {
     background: transparent;
     border: none;
-    border-radius: 5px;
-    margin: 2px 2px 4px 0px;
+    color: rgba(200,200,200,0.45);
+    font-size: 14px;
+    padding: 1px 2px;
+    margin: -2px 0px 0px 0px;
 }
 QToolButton#browserSettingsBtn:hover {
-    background: rgba(0,212,160,0.14);
+    color: rgba(220,220,220,0.85);
 }
 QToolButton#browserSettingsBtn:pressed {
-    background: rgba(255,255,255,0.06);
+    color: #e8e8e8;
 }
 
 /* ---- Bulk "Load Selected Folders" overlay ----
@@ -2826,6 +2828,18 @@ class ImageBrowser(QWidget):
         self.restore_hidden_btn.hide()
         status_lay.addWidget(self.restore_hidden_btn)
 
+        # Reload button — always the rightmost item in the bar. Re-scans
+        # just the currently open (active-tab) top-level folder from disk,
+        # without touching any other configured folder's state.
+        self.reload_folder_btn = QToolButton()
+        self.reload_folder_btn.setObjectName("browserSettingsBtn")
+        self.reload_folder_btn.setText("\u27f3")
+        self.reload_folder_btn.setToolTip("Reload the current folder")
+        self.reload_folder_btn.setCursor(Qt.PointingHandCursor)
+        self.reload_folder_btn.clicked.connect(self.reload_current_folder)
+        self.reload_folder_btn.hide()
+        status_lay.addWidget(self.reload_folder_btn)
+
         self._status_bar = status_bar
         status_bar.adjustSize()
         status_bar.raise_()
@@ -3018,10 +3032,59 @@ class ImageBrowser(QWidget):
         self._update_empty_state()
         self._refresh_restore_hidden_button()
 
+    # -- reload button: re-scan just the current tab's folder --------------
+    def reload_current_folder(self):
+        path = self._current_tab_path()
+        if path:
+            self._reload_folder_tab(path)
+
+    def _reload_folder_tab(self, path):
+        index = next(
+            (i for i, section in enumerate(self._top_sections) if section.path == path),
+            None,
+        )
+        if index is None:
+            return
+
+        # Drop cached scan results for this folder and everything nested
+        # under it, so the rebuild below reflects what's on disk right
+        # now instead of a stale rough-scan cache entry.
+        prefix = path.rstrip(os.sep) + os.sep
+        for cached_path in [p for p in _ROUGH_SCAN_CACHE if p == path or p.startswith(prefix)]:
+            del _ROUGH_SCAN_CACHE[cached_path]
+        self._purge_section_registry(path)
+
+        old_section = self._top_sections[index]
+
+        scroll = _AutopanScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        section = FolderSection(self, path, depth=0, closable=False)
+        wrapper = _RubberBandArea(self)
+        wrapper_lay = QVBoxLayout(wrapper)
+        wrapper_lay.setContentsMargins(12, 12, 12, 12)
+        wrapper_lay.addWidget(section)
+        wrapper_lay.addStretch(1)
+        scroll.setWidget(wrapper)
+
+        name = Path(path).name or path
+        self.tabs.removeTab(index)
+        self.tabs.insertTab(index, scroll, name)
+        self.tabs.setTabToolTip(index, path)
+        self._top_sections[index] = section
+        self.tabs.setCurrentIndex(index)
+        old_section.deleteLater()
+
+        if path in self.saved_expanded_paths:
+            section.set_expanded(True, persist=False)
+
+        self._trigger_rough_pass_for_tab(index)
+
     def _update_empty_state(self):
         has_tabs = self.tabs.count() > 0
         self.tabs.setVisible(has_tabs)
         self.empty_hint.setVisible(not has_tabs)
+        self.reload_folder_btn.setVisible(has_tabs)
         if not has_tabs:
             if self._closed_this_session:
                 self.empty_hint.setText(
@@ -3117,7 +3180,9 @@ class ImageBrowser(QWidget):
         if bar is None:
             return
         bar.adjustSize()
-        bar.move(max(0, self.width() - bar.width()), 0)
+        tab_bar_height = self.tabs.tabBar().sizeHint().height()
+        y = max(0, (tab_bar_height - bar.height()) // 2)
+        bar.move(max(0, self.width() - bar.width()), y)
         bar.raise_()
 
 
