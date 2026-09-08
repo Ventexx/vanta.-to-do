@@ -613,6 +613,13 @@ QLabel#bulkLoadDetail {
     color: rgba(230,230,230,0.85);
     font-size: 12px;
 }
+/* ---- Queue count badge (red circle/pill, white digits) ---- */
+QLabel#queueCountBadgeLabel {
+    background: transparent;
+    color: #ffffff;
+    font-size: 10px;
+    font-weight: 700;
+}
 /* ---- Folder section header (ported from vael. indexer's #sectionHeader:
    flat, text-only, no box at rest; depth conveyed by weight/color, not by
    a bordered frame; hover adds a thin left accent bar). ---- */
@@ -2748,6 +2755,110 @@ class _BulkLoadOverlay(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Generic dimming/blur backdrop reused behind the Settings and Hotkeys
+# dialogs -- visually identical treatment to _BulkLoadOverlay above (same
+# blurred snapshot + dark fill), just without any panel/progress content of
+# its own, so it reads the same "you can't interact with the app right now"
+# way a bulk folder load does.
+# ---------------------------------------------------------------------------
+class _ModalDimOverlay(QWidget):
+    BLUR_RADIUS = 22
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._blurred_bg = None
+        self.hide()
+
+    def show_overlay(self):
+        self.resize(self.parent().size())
+        self._capture_blurred_background()
+        self.show()
+        self.raise_()
+
+    def hide_overlay(self):
+        self.hide()
+        self._blurred_bg = None
+
+    def _capture_blurred_background(self):
+        self.hide()
+        snapshot = self.parent().grab()
+        self.show()
+        if snapshot.isNull():
+            self._blurred_bg = None
+            return
+        scene = QGraphicsScene()
+        item = QGraphicsPixmapItem(snapshot)
+        blur = QGraphicsBlurEffect()
+        blur.setBlurRadius(self.BLUR_RADIUS)
+        item.setGraphicsEffect(blur)
+        scene.addItem(item)
+        result = QPixmap(snapshot.size())
+        result.fill(Qt.transparent)
+        p = QPainter(result)
+        scene.render(p)
+        p.end()
+        self._blurred_bg = result
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        if self._blurred_bg is not None:
+            p.drawPixmap(0, 0, self._blurred_bg)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 110))
+        p.end()
+
+
+# ---------------------------------------------------------------------------
+# Small red "count" badge used to show how many posts are currently queued
+# (spec: Queue count indicator). Draws itself as a perfect circle for
+# single-digit counts and widens into a pill/stadium shape once the number
+# needs more horizontal room (double/triple digits+), so the digits never
+# get squeezed into an undersized circle.
+# ---------------------------------------------------------------------------
+class _QueueCountBadge(QWidget):
+    HEIGHT = 18
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("queueCountBadge")
+        self._count = 0
+        self._label = QLabel(self)
+        self._label.setObjectName("queueCountBadgeLabel")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedSize(self.HEIGHT, self.HEIGHT)
+        self.hide()
+
+    def count(self):
+        return self._count
+
+    def set_count(self, count):
+        self._count = max(0, int(count))
+        if self._count <= 0:
+            self.hide()
+            return
+        self._label.setText(str(self._count) if self._count < 1000 else "999+")
+        self._resize_to_content()
+        self.show()
+        self.raise_()
+
+    def _resize_to_content(self):
+        fm = self._label.fontMetrics()
+        text_w = fm.horizontalAdvance(self._label.text())
+        w = max(self.HEIGHT, text_w + 12)
+        self.setFixedSize(w, self.HEIGHT)
+        self._label.setGeometry(0, 0, w, self.HEIGHT)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#e5484d"))
+        radius = self.height() / 2
+        p.drawRoundedRect(self.rect(), radius, radius)
+        p.end()
+
+
+# ---------------------------------------------------------------------------
 # Center — Image Browser. A single, persistent, global instance shared by
 # every workflow: one tab per configured top-level folder (always fully
 # recursive), lazy scanning off the UI thread, and an in-memory-only
@@ -3008,6 +3119,8 @@ class ImageBrowser(QWidget):
             scroll = _AutopanScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             section = FolderSection(self, path, depth=0, closable=False)
             wrapper = _RubberBandArea(self)
             wrapper_lay = QVBoxLayout(wrapper)
@@ -3059,6 +3172,8 @@ class ImageBrowser(QWidget):
         scroll = _AutopanScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         section = FolderSection(self, path, depth=0, closable=False)
         wrapper = _RubberBandArea(self)
         wrapper_lay = QVBoxLayout(wrapper)
@@ -3311,7 +3426,7 @@ class RosterBar(QWidget):
         # space is left in the bar, and its own resize (driven by dragging
         # the center splitter handle) is what drives the icon rescale.
         scroll.setMinimumHeight(self.MIN_ICON_SIZE + 16)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.resized.connect(self._sync_icon_size)
         scroll.resized.connect(self._position_status_label)
@@ -3804,6 +3919,12 @@ class OutputsTab(QWidget):
         self.queue_mode_btn.clicked.connect(lambda: self._set_mode(1))
         header.addWidget(self.queue_mode_btn, 1)
 
+        # Queue count badge, sidebar-open position: sits just to the right
+        # of the "Queue" tab label. Mirrored by MainWindow.queue_badge_
+        # collapsed for when the sidebar is closed (see MainWindow).
+        self.queue_badge = _QueueCountBadge()
+        header.addWidget(self.queue_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
         layout.addLayout(header)
 
         # -- stacked content --------------------------------------------
@@ -3816,10 +3937,14 @@ class OutputsTab(QWidget):
         self.outputs_list.setResizeMode(QListWidget.Adjust)
         self.outputs_list.setMovement(QListWidget.Static)
         self.outputs_list.setSpacing(10)
+        self.outputs_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.outputs_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.outputs_list.itemDoubleClicked.connect(self._open_item)
         self.stack.addWidget(self.outputs_list)
 
         self.queue_list = QListWidget()
+        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.queue_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.stack.addWidget(self.queue_list)
 
         # -- footer: contextual actions for whichever mode is active.
@@ -3864,9 +3989,11 @@ class OutputsTab(QWidget):
         layout.addWidget(footer)
 
         main_window.queue_manager.queueChanged.connect(self._refresh_queue)
+        main_window.queue_manager.queueChanged.connect(self._update_badge)
         self._set_mode(0)
         self.refresh()
         self._refresh_queue()
+        self._update_badge()
 
     # -- mode switching ---------------------------------------------------
     def _set_mode(self, mode):
@@ -3926,9 +4053,12 @@ class OutputsTab(QWidget):
             text = f"[{item['status']}]  {item['tab_name']}"
             self.queue_list.addItem(QListWidgetItem(text))
 
+    def _update_badge(self):
+        self.queue_badge.set_count(len(self.main_window.queue_manager.items))
+
 
 # ---------------------------------------------------------------------------
-# Settings dialog (server address, output path, hotkey overview)
+# Settings dialog (server address, output path, folder configuration)
 # opened from the settings icon in the top-right corner of the window
 # ---------------------------------------------------------------------------
 class SettingsDialog(QDialog):
@@ -3940,10 +4070,12 @@ class SettingsDialog(QDialog):
         self.resize(620, 720)
 
         # The whole settings menu scrolls as one unit (form fields, folder
-        # tables, hotkeys, and the Close/Save row all live inside), but the
+        # tables, and the Close/Save row all live inside), but the
         # scrollbar itself stays hidden -- the mouse wheel / trackpad still
         # scrolls it fine via QScrollArea's default wheel handling, it's
-        # just not drawn.
+        # just not drawn. Hotkeys now live in their own dialog (see
+        # HotkeysDialog) reachable from the "?" button in the workflow
+        # sidebar.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
@@ -4076,19 +4208,7 @@ class SettingsDialog(QDialog):
 
         self._refresh_ignore_table()
 
-        hk_title = QLabel("Hotkeys")
-        hk_title.setObjectName("sectionTitle")
-        layout.addWidget(hk_title)
-
-        table = QTableWidget(len(HOTKEYS), 2)
-        table.setHorizontalHeaderLabels(["Shortcut", "Action"])
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.verticalHeader().hide()
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        for row, (seq, desc) in enumerate(HOTKEYS):
-            table.setItem(row, 0, QTableWidgetItem(seq))
-            table.setItem(row, 1, QTableWidgetItem(desc))
-        layout.addWidget(table, 1)
+        layout.addStretch(1)
 
         btns = QHBoxLayout()
         btns.addStretch(1)
@@ -4213,6 +4333,45 @@ class SettingsDialog(QDialog):
         self.main_window.persist_all()
         self.main_window.image_browser.reload_folders()
         self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Hotkeys dialog — split out of Settings so it's reachable on its own via
+# the "?" button in the workflow sidebar. Unlike Settings, there's nothing
+# here to edit, so there's no outer QScrollArea wrapping the whole content:
+# the hotkey table itself is the only thing that scrolls.
+# ---------------------------------------------------------------------------
+class HotkeysDialog(QDialog):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.setWindowTitle("Hotkeys")
+        self.setMinimumWidth(480)
+        self.resize(520, 560)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel("Hotkeys")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        table = QTableWidget(len(HOTKEYS), 2)
+        table.setHorizontalHeaderLabels(["Shortcut", "Action"])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.verticalHeader().hide()
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for row, (seq, desc) in enumerate(HOTKEYS):
+            table.setItem(row, 0, QTableWidgetItem(seq))
+            table.setItem(row, 1, QTableWidgetItem(desc))
+        layout.addWidget(table, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        btns.addWidget(close_btn)
+        layout.addLayout(btns)
 
 
 # ---------------------------------------------------------------------------
@@ -4625,6 +4784,8 @@ class WorkflowSidebar(QWidget):
         self.list = QListWidget()
         self.list.setObjectName("workflowList")
         self.list.setDragDropMode(QListWidget.InternalMove)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.currentRowChanged.connect(main_window._on_workflow_selected)
         self.list.itemDoubleClicked.connect(main_window._edit_workflow_by_item)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -4651,6 +4812,17 @@ class WorkflowSidebar(QWidget):
         self.settings_btn.clicked.connect(main_window._open_settings_from_workflow_sidebar)
         bottom_row.addWidget(self.settings_btn)
         bottom_row.addStretch(1)
+
+        # Hotkeys lives in the opposite (bottom-right) corner of the
+        # sidebar, mirroring Settings' bottom-left placement -- just a "?"
+        # glyph since there's nothing here to configure, only to look up.
+        self.hotkeys_btn = QToolButton()
+        self.hotkeys_btn.setObjectName("iconButton")
+        self.hotkeys_btn.setText("?")
+        self.hotkeys_btn.setToolTip("Hotkeys")
+        self.hotkeys_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hotkeys_btn.clicked.connect(main_window._open_hotkeys_from_workflow_sidebar)
+        bottom_row.addWidget(self.hotkeys_btn)
         content_layout.addLayout(bottom_row)
 
         layout.addWidget(content, 1)
@@ -4982,6 +5154,12 @@ class MainWindow(QMainWindow):
         self._img_viewer = ImgViewerOverlay(root)
         self._img_viewer.resize(root.size())
 
+        # Dimming/blur backdrop shared by the Settings and Hotkeys dialogs
+        # (see open_settings / open_hotkeys) -- same treatment as the bulk
+        # folder-load overlay, so it's clear the app can't be interacted
+        # with while either dialog is open.
+        self._modal_dim_overlay = _ModalDimOverlay(root)
+
         self.roster_bar = RosterBar(self)
         self.center_splitter.addWidget(self.roster_bar)
 
@@ -5010,6 +5188,14 @@ class MainWindow(QMainWindow):
         self.outputs_edge_tab.raise_()
         self.queue_manager.itemFinished.connect(lambda *_: self.outputs_tab.refresh())
 
+        # Queue count badge, sidebar-closed position: sits directly below
+        # the edge-tab open button. Shown only while the sidebar itself is
+        # closed -- once it's open, OutputsTab's own header badge (right of
+        # the "Queue" label) takes over instead.
+        self.queue_badge_collapsed = _QueueCountBadge(self.center_container)
+        self.queue_manager.queueChanged.connect(self._update_collapsed_queue_badge)
+        self._update_collapsed_queue_badge()
+
         for workflow_data in self.config_data.get("tabs", []):
             self._add_workflow(workflow_data, select=False)
         if self.workflow_states:
@@ -5036,6 +5222,7 @@ class MainWindow(QMainWindow):
         self.outputs_sidebar.toggle()
         self._sync_outputs_edge_tab()
         self.outputs_edge_tab.raise_()
+        self._position_collapsed_queue_badge()
 
     def _toggle_workflow_sidebar(self):
         self.workflow_sidebar.toggle()
@@ -5051,6 +5238,31 @@ class MainWindow(QMainWindow):
     def _sync_outputs_edge_tab(self):
         open_ = self.outputs_sidebar.is_open()
         self.outputs_edge_tab.set_open_state(open_)
+
+    # -- queue count badge (sidebar-closed position) ------------------------
+    def _update_collapsed_queue_badge(self):
+        badge = getattr(self, "queue_badge_collapsed", None)
+        if badge is None:
+            return
+        badge.set_count(len(self.queue_manager.items))
+        self._position_collapsed_queue_badge()
+
+    def _position_collapsed_queue_badge(self):
+        badge = getattr(self, "queue_badge_collapsed", None)
+        edge = getattr(self, "outputs_edge_tab", None)
+        sidebar = getattr(self, "outputs_sidebar", None)
+        if badge is None or edge is None:
+            return
+        bx = edge.x() + (edge.width() - badge.width()) // 2
+        by = edge.y() + edge.height() + 4
+        badge.move(bx, by)
+        badge.raise_()
+        # Only ever visible while the sidebar is closed -- once it's open,
+        # OutputsTab's own header badge takes over (see OutputsTab).
+        if badge.count() <= 0 or (sidebar is not None and sidebar.is_open()):
+            badge.hide()
+        else:
+            badge.show()
 
     def _position_sidebar(self):
         """Keep the outputs sidebar (and its always-visible edge tab)
@@ -5072,6 +5284,7 @@ class MainWindow(QMainWindow):
                 edge.WIDTH, edge.HEIGHT,
             )
             edge.raise_()
+        self._position_collapsed_queue_badge()
 
     def _position_workflow_sidebar(self):
         """Same idea, mirrored: keeps the workflow sidebar (and its always-
@@ -5150,8 +5363,12 @@ class MainWindow(QMainWindow):
         self.persist_all()
 
     def open_settings(self):
-        dlg = SettingsDialog(self)
-        dlg.exec()
+        self._modal_dim_overlay.show_overlay()
+        try:
+            dlg = SettingsDialog(self)
+            dlg.exec()
+        finally:
+            self._modal_dim_overlay.hide_overlay()
 
     def _open_settings_from_workflow_sidebar(self):
         """Settings button lives at the bottom of the workflow sidebar;
@@ -5160,6 +5377,22 @@ class MainWindow(QMainWindow):
         if self.workflow_sidebar.is_open():
             self.workflow_sidebar.set_open(False)
         self.open_settings()
+
+    def open_hotkeys(self):
+        self._modal_dim_overlay.show_overlay()
+        try:
+            dlg = HotkeysDialog(self)
+            dlg.exec()
+        finally:
+            self._modal_dim_overlay.hide_overlay()
+
+    def _open_hotkeys_from_workflow_sidebar(self):
+        """Hotkeys button lives at the bottom of the workflow sidebar,
+        opposite Settings; opening it auto-closes that sidebar the same
+        way Settings does."""
+        if self.workflow_sidebar.is_open():
+            self.workflow_sidebar.set_open(False)
+        self.open_hotkeys()
 
     def _on_workflow_rows_moved(self, parent, start, end, dest_parent, dest_row):
         # Drag-reordering in the sidebar list already moved the visual rows;
@@ -5399,6 +5632,10 @@ class MainWindow(QMainWindow):
         bulk_overlay = getattr(getattr(self, "image_browser", None), "bulk_overlay", None)
         if bulk_overlay is not None and bulk_overlay.isVisible():
             bulk_overlay.resize(self._content_root.size())
+        modal_dim = getattr(self, "_modal_dim_overlay", None)
+        if modal_dim is not None and modal_dim.isVisible():
+            modal_dim.resize(self._content_root.size())
+        self._position_collapsed_queue_badge()
         self._update_window_mask()
 
     def _toggle_maximize(self, force_normal: bool = False) -> None:
