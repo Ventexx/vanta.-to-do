@@ -17,6 +17,7 @@ from PySide6.QtCore import QByteArray, QEvent, QMimeData, QPoint, QSize, Qt, QTh
 from PySide6.QtGui import QAction, QColor, QCursor, QDrag, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -760,6 +762,13 @@ class DevDatabase:
         self.name = "[DEV MODE]"
         # In-memory only, never persisted - resets every DevDatabase() re-init.
         self._identifiers: list[str] = ["Adult", "Curvy", "Fantasy"]
+        # Temporary identifiers (never saved anywhere, not even here really -
+        # but DevDatabase is already 100% in-memory, so this just tracks which
+        # names are *displayed* as temporary and keeps their membership out of
+        # asset json_data, matching real Database's contract).
+        self._temporary: set[str] = set()
+        self._temp_members: dict[str, set[str]] = {}
+        self._display_order: list[str] = list(self._identifiers)
 
     # ── API surface (matches Database) ────────────────────────────────────
 
@@ -780,7 +789,17 @@ class DevDatabase:
                     data = json.loads(a.get("json_data", "{}"))
                 except Exception:
                     data = {}
-                ident = str(data.get("Identifier", "") or "").lower()
+                tokens = [
+                    t.strip()
+                    for t in str(data.get("Identifier", "") or "").split(",")
+                    if t.strip()
+                ]
+                tokens.extend(
+                    name
+                    for name, members in self._temp_members.items()
+                    if a.get("image_path", "") in members
+                )
+                ident = ", ".join(tokens).lower()
                 if q in ident:
                     results.append(a)
             return results[:limit]
@@ -825,21 +844,81 @@ class DevDatabase:
     # ── Identifiers (Manage ID / Edit ID) - in-memory only, never saved ────
 
     def get_identifiers(self) -> list[str]:
-        return list(self._identifiers)
+        return list(self._display_order)
 
-    def add_identifier(self, name: str) -> None:
-        self._identifiers.append(name)
+    def is_temporary(self, name: str) -> bool:
+        return name in self._temporary
+
+    def add_identifier(self, name: str, temporary: bool = False) -> None:
+        if temporary:
+            self._temporary.add(name)
+            self._temp_members.setdefault(name, set())
+        else:
+            self._identifiers.append(name)
+        if name not in self._display_order:
+            self._display_order.append(name)
 
     def rename_identifier(self, old_name: str, new_name: str) -> None:
-        self._identifiers = [
-            new_name if n == old_name else n for n in self._identifiers
+        if old_name in self._temporary:
+            self._temporary.discard(old_name)
+            self._temporary.add(new_name)
+            self._temp_members[new_name] = self._temp_members.pop(old_name, set())
+        else:
+            self._identifiers = [
+                new_name if n == old_name else n for n in self._identifiers
+            ]
+        self._display_order = [
+            new_name if n == old_name else n for n in self._display_order
         ]
 
     def remove_identifier(self, name: str) -> None:
-        self._identifiers = [n for n in self._identifiers if n != name]
+        if name in self._temporary:
+            self._temporary.discard(name)
+            self._temp_members.pop(name, None)
+        else:
+            self._identifiers = [n for n in self._identifiers if n != name]
+        self._display_order = [n for n in self._display_order if n != name]
 
     def set_identifiers_order(self, names: list[str]) -> None:
-        self._identifiers = list(names)
+        self._display_order = list(names)
+        self._identifiers = [n for n in names if n not in self._temporary]
+
+    def all_assets(self) -> list[dict]:
+        return list(self._assets)
+
+    def toggle_temp_member(self, name: str, image_path: str) -> bool:
+        members = self._temp_members.setdefault(name, set())
+        if image_path in members:
+            members.discard(image_path)
+            return False
+        members.add(image_path)
+        return True
+
+    def temp_members(self, name: str) -> set[str]:
+        return set(self._temp_members.get(name, set()))
+
+    def remove_temp_member(self, name: str, image_path: str) -> None:
+        self._temp_members.get(name, set()).discard(image_path)
+
+    def all_temp_member_names_for(self, image_path: str) -> list[str]:
+        return [
+            n for n, members in self._temp_members.items() if image_path in members
+        ]
+
+    def set_identifier_temporary(
+        self, name: str, temporary: bool, members: Optional[set[str]] = None
+    ) -> None:
+        """Flip the persisted<->temporary bookkeeping bit only. The caller is
+        responsible for migrating any asset JSON before/after this call."""
+        if temporary and name not in self._temporary:
+            self._identifiers = [n for n in self._identifiers if n != name]
+            self._temporary.add(name)
+            self._temp_members[name] = set(members) if members else set()
+        elif not temporary and name in self._temporary:
+            self._temporary.discard(name)
+            self._temp_members.pop(name, None)
+            if name not in self._identifiers:
+                self._identifiers.append(name)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -858,6 +937,17 @@ class Database:
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._migrate()
+        # Temporary identifiers live ONLY in this process's memory - never
+        # written to the sqlite file or any asset's JSON. They vanish the
+        # moment the app closes or this database is reloaded.
+        self._temporary: set[str] = set()
+        self._temp_members: dict[str, set[str]] = {}
+        self._display_order: list[str] = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT name FROM identifiers ORDER BY sort_order"
+            ).fetchall()
+        ]
 
     def _migrate(self) -> None:
         self._conn.execute("""
@@ -910,7 +1000,9 @@ class Database:
     ) -> list[dict]:
         if id_only:
             # "id-<value>" mode: case-insensitive substring match against the
-            # "Identifier" field's value specifically (not any other field).
+            # active identifier name(s) - both persisted (stored in the
+            # asset's own JSON "Identifier" field) and temporary (tracked only
+            # in this Database instance's memory) count equally here.
             q = query.lower()
             rows = self._conn.execute(
                 "SELECT * FROM assets ORDER BY folder, name"
@@ -922,7 +1014,17 @@ class Database:
                     data = json.loads(d.get("json_data", "{}"))
                 except Exception:
                     data = {}
-                ident = str(data.get("Identifier", "") or "").lower()
+                tokens = [
+                    t.strip()
+                    for t in str(data.get("Identifier", "") or "").split(",")
+                    if t.strip()
+                ]
+                tokens.extend(
+                    name
+                    for name, members in self._temp_members.items()
+                    if d.get("image_path", "") in members
+                )
+                ident = ", ".join(tokens).lower()
                 if q in ident:
                     results.append(d)
             return results[:limit]
@@ -967,39 +1069,116 @@ class Database:
     # the Manage Identifiers window and the card's "Edit ID" submenu.
 
     def get_identifiers(self) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT name FROM identifiers ORDER BY sort_order"
-        ).fetchall()
-        return [r[0] for r in rows]
+        return list(self._display_order)
 
-    def add_identifier(self, name: str) -> None:
+    def is_temporary(self, name: str) -> bool:
+        return name in self._temporary
+
+    def _next_sort_order(self) -> int:
         row = self._conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) FROM identifiers"
         ).fetchone()
-        next_order = (row[0] if row and row[0] is not None else -1) + 1
-        self._conn.execute(
-            "INSERT INTO identifiers(name, sort_order) VALUES(?,?)",
-            (name, next_order),
-        )
-        self._conn.commit()
+        return (row[0] if row and row[0] is not None else -1) + 1
+
+    def add_identifier(self, name: str, temporary: bool = False) -> None:
+        if temporary:
+            self._temporary.add(name)
+            self._temp_members.setdefault(name, set())
+        else:
+            self._conn.execute(
+                "INSERT INTO identifiers(name, sort_order) VALUES(?,?)",
+                (name, self._next_sort_order()),
+            )
+            self._conn.commit()
+        if name not in self._display_order:
+            self._display_order.append(name)
 
     def rename_identifier(self, old_name: str, new_name: str) -> None:
-        self._conn.execute(
-            "UPDATE identifiers SET name=? WHERE name=?", (new_name, old_name)
-        )
-        self._conn.commit()
+        if old_name in self._temporary:
+            self._temporary.discard(old_name)
+            self._temporary.add(new_name)
+            self._temp_members[new_name] = self._temp_members.pop(old_name, set())
+        else:
+            self._conn.execute(
+                "UPDATE identifiers SET name=? WHERE name=?", (new_name, old_name)
+            )
+            self._conn.commit()
+        self._display_order = [
+            new_name if n == old_name else n for n in self._display_order
+        ]
 
     def remove_identifier(self, name: str) -> None:
-        self._conn.execute("DELETE FROM identifiers WHERE name=?", (name,))
-        self._conn.commit()
+        if name in self._temporary:
+            self._temporary.discard(name)
+            self._temp_members.pop(name, None)
+        else:
+            self._conn.execute("DELETE FROM identifiers WHERE name=?", (name,))
+            self._conn.commit()
+        self._display_order = [n for n in self._display_order if n != name]
 
     def set_identifiers_order(self, names: list[str]) -> None:
-        """Persist a full reordering. `names` must contain every identifier."""
+        """Persist a full reordering. `names` must contain every identifier
+        (temporary ones included, though only the persisted subset is
+        actually written to sqlite - temporary order lives in memory only,
+        captured via `_display_order`)."""
+        self._display_order = list(names)
+        persisted = [n for n in names if n not in self._temporary]
         self._conn.executemany(
             "UPDATE identifiers SET sort_order=? WHERE name=?",
-            [(i, n) for i, n in enumerate(names)],
+            [(i, n) for i, n in enumerate(persisted)],
         )
         self._conn.commit()
+
+    def all_assets(self) -> list[dict]:
+        """Every indexed asset, uncapped (unlike search()'s default limit)."""
+        rows = self._conn.execute(
+            "SELECT * FROM assets ORDER BY folder, name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def toggle_temp_member(self, name: str, image_path: str) -> bool:
+        """Flip membership of image_path in temporary identifier `name`.
+        Returns the new active state (True=added, False=removed)."""
+        members = self._temp_members.setdefault(name, set())
+        if image_path in members:
+            members.discard(image_path)
+            return False
+        members.add(image_path)
+        return True
+
+    def temp_members(self, name: str) -> set[str]:
+        return set(self._temp_members.get(name, set()))
+
+    def remove_temp_member(self, name: str, image_path: str) -> None:
+        self._temp_members.get(name, set()).discard(image_path)
+
+    def all_temp_member_names_for(self, image_path: str) -> list[str]:
+        """All temporary identifier names currently active on this asset."""
+        return [
+            n for n, members in self._temp_members.items() if image_path in members
+        ]
+
+    def set_identifier_temporary(
+        self, name: str, temporary: bool, members: Optional[set[str]] = None
+    ) -> None:
+        """Flip the persisted<->temporary bookkeeping bit only (sqlite row vs.
+        in-memory set). The caller (ManageIdentifiersDialog) is responsible
+        for migrating each affected asset's JSON before/after this call -
+        this method only knows about the `identifiers` table/memory, not
+        asset files."""
+        if temporary and name not in self._temporary:
+            self._conn.execute("DELETE FROM identifiers WHERE name=?", (name,))
+            self._conn.commit()
+            self._temporary.add(name)
+            self._temp_members[name] = set(members) if members else set()
+        elif not temporary and name in self._temporary:
+            self._temporary.discard(name)
+            self._temp_members.pop(name, None)
+            self._conn.execute(
+                "INSERT INTO identifiers(name, sort_order) VALUES(?,?)",
+                (name, self._next_sort_order()),
+            )
+            self._conn.commit()
 
     def count(self) -> int:
         """Return the total number of indexed assets."""
@@ -1580,6 +1759,16 @@ class AddTagDialog(_DraggableDialog):
         self.accept()
 
 
+def _default_identifier_name(existing: list[str]) -> str:
+    """Smallest-unused-N default name ('Identifier 1', 'Identifier 2', ...)
+    used whenever an identifier is created without a name typed in."""
+    existing_set = set(existing)
+    n = 1
+    while f"Identifier {n}" in existing_set:
+        n += 1
+    return f"Identifier {n}"
+
+
 class _IdentifierMenuRow(QWidget):
     """One row in the card's 'Edit ID' submenu.
 
@@ -1653,7 +1842,6 @@ class ThumbnailCard(QWidget):
         self._hovered = False
         self._drag_start_pos: Optional[QPoint] = None
         self._show_tagged_mode = False
-        self._id_menu_dirty = False  # set True while an Edit ID menu session toggles anything
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1832,12 +2020,6 @@ class ThumbnailCard(QWidget):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         menu.setObjectName("cardMenu")
-        # Batches Edit ID toggles: each toggle just flips this flag instead of
-        # reloading the grid immediately. We only reload once, after the menu
-        # has fully closed - see the bottom of this method. Reloading while
-        # the menu's own exec() loop is still running would rebuild (and
-        # could destroy) the very card/menu currently on screen.
-        self._id_menu_dirty = False
 
         try:
             data: dict = json.loads(self.asset.get("json_data", "{}"))
@@ -1892,19 +2074,16 @@ class ThumbnailCard(QWidget):
         # ── Edit ID submenu ──────────────────────────────────────────────
         # Hover expands the list of this database's Identifiers, in the exact
         # order configured in "Manage Identifiers". Clicking one toggles it on
-        # this asset's JSON without closing the menu (multi-select). Active
-        # identifiers are marked with an orange dot.
+        # this asset without closing the menu (multi-select). Active
+        # identifiers are marked with an orange dot. Nothing here ever emits
+        # `edited` / triggers a grid reload - toggling an identifier changes
+        # no visible pixel on the card itself, so there's nothing to redraw.
         id_menu = menu.addMenu("Edit ID")
-        self._build_edit_id_menu(id_menu)
+        add_identifier_act = self._build_edit_id_menu(id_menu)
 
         edit_act = menu.addAction("Edit JSON...")
         chosen = menu.exec(event.globalPos())
-        # Menu is fully closed now - safe to reload the grid if any Edit ID
-        # toggles happened during this session (one reload for however many
-        # identifiers were clicked, not one per click).
         if chosen is None:
-            if self._id_menu_dirty:
-                self.edited.emit(self.asset["image_path"])
             return
         if chosen is edit_act:
             dlg = EditJsonDialog(self.asset, self._db, self)
@@ -1913,30 +2092,73 @@ class ThumbnailCard(QWidget):
                 self.edited.emit(self.asset["image_path"])
         elif chosen is add_tag_act:
             self._add_tag()
+        elif chosen is add_identifier_act:
+            self._add_identifier_from_menu()
         elif chosen.data():
             QApplication.clipboard().setText(chosen.data())
 
-    def _build_edit_id_menu(self, id_menu: QMenu) -> None:
+    def _build_edit_id_menu(self, id_menu: QMenu) -> Optional[QAction]:
         """Populate the 'Edit ID' submenu with one toggleable row per
         Identifier configured for the active database, in Manage Identifiers
         order. Rows consume their own clicks so the menu stays open, letting
-        the user select/deselect multiple identifiers in one go."""
-        if self._db is None:
-            id_menu.setEnabled(False)
-            return
-        identifiers = self._db.get_identifiers()
-        if not identifiers:
-            id_menu.setEnabled(False)
-            return
-        active = set(self._get_active_identifiers())
-        for name in identifiers:
-            row = _IdentifierMenuRow(name, name in active, self._toggle_identifier)
-            wa = QWidgetAction(id_menu)
-            wa.setDefaultWidget(row)
-            id_menu.addAction(wa)
+        the user select/deselect multiple identifiers in one go.
+
+        The rows sit inside a small QScrollArea capped at 6 visible rows (any
+        more and it scrolls, using the app's minimal scrollbar) so the menu
+        never grows unmanageably tall. A fixed "+ Add Identifier" action
+        always sits at the very bottom, below a separator, outside the
+        scrollable region so it's always reachable. Returns that action so
+        the caller can detect it being chosen."""
+        if self._db is not None:
+            identifiers = self._db.get_identifiers()
+            if identifiers:
+                active = self._get_active_identifier_names()
+                rows_container = QWidget()
+                rows_lay = QVBoxLayout(rows_container)
+                rows_lay.setContentsMargins(0, 2, 0, 2)
+                rows_lay.setSpacing(0)
+                for name in identifiers:
+                    row = _IdentifierMenuRow(
+                        name, name in active, self._toggle_identifier
+                    )
+                    rows_lay.addWidget(row)
+
+                scroll = QScrollArea()
+                scroll.setObjectName("idMenuScroll")
+                scroll.setWidget(rows_container)
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QFrame.Shape.NoFrame)
+                scroll.setStyleSheet("background: transparent;")
+                scroll.setHorizontalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                )
+                scroll.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                )
+                row_h = 22
+                visible_count = min(len(identifiers), 6)
+                scroll.setFixedHeight(row_h * visible_count)
+                scroll.setMinimumWidth(160)
+
+                scroll_wa = QWidgetAction(id_menu)
+                scroll_wa.setDefaultWidget(scroll)
+                id_menu.addAction(scroll_wa)
+            else:
+                empty_lbl = QLabel("No identifiers yet")
+                empty_lbl.setStyleSheet(
+                    "color: rgba(200,200,200,0.45); font-size: 11px;"
+                    " padding: 4px 12px; background: transparent;"
+                )
+                empty_wa = QWidgetAction(id_menu)
+                empty_wa.setDefaultWidget(empty_lbl)
+                id_menu.addAction(empty_wa)
+        id_menu.addSeparator()
+        return id_menu.addAction("+ Add Identifier")
 
     def _get_active_identifiers(self) -> list[str]:
-        """Identifiers currently set on this asset's 'Identifier' field."""
+        """Persisted identifiers currently set on this asset's 'Identifier'
+        JSON field (does not include temporary identifiers - see
+        `_get_active_identifier_names` for the combined view)."""
         try:
             data = json.loads(self.asset.get("json_data", "{}"))
         except Exception:
@@ -1946,21 +2168,30 @@ class ThumbnailCard(QWidget):
             return []
         return [tok.strip() for tok in raw.split(",") if tok.strip()]
 
+    def _get_active_identifier_names(self) -> set[str]:
+        """Every identifier - persisted or temporary - currently active on
+        this asset. Used to light up the dot in the Edit ID submenu."""
+        names = set(self._get_active_identifiers())
+        if self._db is not None:
+            names.update(
+                self._db.all_temp_member_names_for(self.asset.get("image_path", ""))
+            )
+        return names
+
     def _toggle_identifier(self, name: str) -> None:
-        """Add/remove `name` from this asset's 'Identifier' field and persist.
+        """Add/remove `name` from this asset.
 
-        The field is a comma-separated list of active identifier names. If
-        toggling off empties the list, the 'Identifier' key is removed from
-        the JSON entirely; if toggling on and the key is missing, it's added.
-
-        This writes to disk/DB immediately (so a search run right after still
-        sees correct data - search always reads live from the DB anyway) but
-        deliberately does NOT emit `edited` here. Emitting per click would
-        rebuild the whole card grid while this menu's own exec() loop is
-        still running - risking tearing down this very card/menu mid-click.
-        Instead we just flag the session as dirty; contextMenuEvent fires one
-        reload after the menu actually closes, however many were toggled.
+        Temporary identifiers never touch the JSON at all - membership just
+        flips a bit in the Database instance's in-memory set. Persisted
+        identifiers keep the original behaviour: written into the comma-
+        separated 'Identifier' field of the asset's own JSON (and its sidecar
+        .json file on disk), immediately, without emitting `edited` (nothing
+        visible on the card changes either way).
         """
+        if self._db is not None and self._db.is_temporary(name):
+            self._db.toggle_temp_member(name, self.asset.get("image_path", ""))
+            return
+
         try:
             data = json.loads(self.asset.get("json_data", "{}"))
         except Exception:
@@ -1982,7 +2213,6 @@ class ThumbnailCard(QWidget):
             self.asset["json_data"] = new_text
             if self._db:
                 self._db.update_json(self.asset["image_path"], new_text)
-            self._id_menu_dirty = True
             return
 
         json_path = self.asset.get("json_path", "")
@@ -1996,7 +2226,20 @@ class ThumbnailCard(QWidget):
         if self._db:
             self._db.update_json(self.asset["image_path"], new_text)
         self.asset["json_data"] = new_text
-        self._id_menu_dirty = True
+
+    def _add_identifier_from_menu(self) -> None:
+        """'+ Add Identifier' row at the bottom of the card's Edit ID
+        submenu - lets the user create a new Identifier (optionally
+        temporary) without opening Manage ID."""
+        if self._db is None:
+            return
+        dlg = AddIdentifierDialog(self)
+        if not dlg.exec():
+            return
+        name = dlg.identifier_text.strip() or _default_identifier_name(
+            self._db.get_identifiers()
+        )
+        self._db.add_identifier(name, temporary=dlg.temporary)
 
     def _add_tag(self) -> None:
         dlg = AddTagDialog(self)
@@ -3405,11 +3648,12 @@ class AddIdentifierDialog(_DraggableDialog):
     for editing an existing one (title/text is swapped by the caller)."""
 
     _PREFS_KEY = "add_identifier_pos"
-    W, H = 360, 148
+    W, H = 360, 178
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.identifier_text: str = ""
+        self.temporary: bool = False
         self.setWindowTitle("Add Identifier")
         self.setModal(True)
         self.setFixedSize(self.W, self.H)
@@ -3472,6 +3716,19 @@ class AddIdentifierDialog(_DraggableDialog):
         self._name_edit.setFixedHeight(24)
         self._name_edit.returnPressed.connect(self._accept)
         b_lay.addWidget(self._name_edit)
+
+        self._temp_check = QCheckBox("Temporary (not saved)")
+        self._temp_check.setObjectName("identifierTempCheck")
+        self._temp_check.setStyleSheet(
+            "color: rgba(220,220,220,0.75); font-size: 11px; background: transparent;"
+        )
+        self._temp_check.setToolTip(
+            "Kept only in memory for this session - never written to disk,\n"
+            "so it isn't included in this image's JSON and won't survive a restart."
+        )
+        b_lay.addSpacing(10)
+        b_lay.addWidget(self._temp_check)
+
         b_lay.addStretch()
         lay.addWidget(body, 1)
 
@@ -3511,21 +3768,139 @@ class AddIdentifierDialog(_DraggableDialog):
     def set_text(self, text: str) -> None:
         self._name_edit.setText(text)
 
+    def set_temporary(self, temporary: bool) -> None:
+        self._temp_check.setChecked(temporary)
+
     def _accept(self) -> None:
+        # An empty name is allowed here - the caller falls back to an
+        # auto-generated "Identifier N" name when this comes back blank.
         self.identifier_text = self._name_edit.text().strip()
-        if not self.identifier_text:
-            return
+        self.temporary = self._temp_check.isChecked()
         self.accept()
 
 
 # ── Manage Identifiers Dialog ────────────────────────────────────────────────
 
 
+class _ManageIdRow(QWidget):
+    """One top-level identifier row inside the Manage Identifiers list.
+
+    Has an expand/collapse arrow (same look as a folder header's arrow) on
+    the left, then the name (italic when the identifier is temporary). The
+    row forwards plain clicks to `on_select` so the underlying QListWidgetItem
+    still gets selected (needed for the Up/Down/Edit/Remove footer buttons),
+    while the arrow toggles expansion independently.
+    """
+
+    arrow_clicked = Signal(str)
+    row_clicked = Signal(str)
+
+    def __init__(self, name: str, temporary: bool, expanded: bool, parent=None):
+        super().__init__(parent)
+        self._name = name
+        self.setFixedHeight(24)
+        self.setStyleSheet("background: transparent;")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 0, 8, 0)
+        lay.setSpacing(4)
+
+        self._arrow_btn = QToolButton()
+        self._arrow_btn.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._arrow_btn.setFixedSize(16, 16)
+        self._arrow_btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none; }"
+        )
+        self._arrow_btn.clicked.connect(lambda: self.arrow_clicked.emit(self._name))
+        lay.addWidget(self._arrow_btn)
+
+        self._label = QLabel(name)
+        font = self._label.font()
+        font.setItalic(temporary)
+        self._label.setFont(font)
+        self._label.setStyleSheet(
+            "color: rgba(220,220,220,0.88); font-size: 11px; background: transparent;"
+        )
+        lay.addWidget(self._label)
+
+        if temporary:
+            tag = QLabel("temp")
+            tag.setStyleSheet(
+                "color: rgba(232,184,75,0.75); font-size: 9px; font-style: italic;"
+                " background: transparent;"
+            )
+            lay.addWidget(tag)
+
+        lay.addStretch()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.row_clicked.emit(self._name)
+        super().mouseReleaseEvent(event)
+
+
+class _ManageMemberRow(QWidget):
+    """One member row nested under an expanded identifier: just the image's
+    name, plus a hover-reveal '−' button on the right for removing it from
+    this identifier. No thumbnail, no other interaction."""
+
+    remove_clicked = Signal(str, str)  # (identifier_name, image_path)
+
+    def __init__(self, identifier_name: str, display_name: str, image_path: str, parent=None):
+        super().__init__(parent)
+        self._identifier_name = identifier_name
+        self._image_path = image_path
+        self.setFixedHeight(22)
+        self.setStyleSheet("background: transparent;")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(24, 0, 8, 0)
+        lay.setSpacing(4)
+
+        label = QLabel(display_name)
+        label.setStyleSheet(
+            "color: rgba(200,200,200,0.65); font-size: 10.5px; background: transparent;"
+        )
+        lay.addWidget(label)
+        lay.addStretch()
+
+        self._remove_btn = QToolButton()
+        self._remove_btn.setText("−")
+        self._remove_btn.setFixedSize(16, 16)
+        self._remove_btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none;"
+            " color: rgba(255,120,120,0.85); font-size: 12px; }"
+            "QToolButton:hover { color: rgb(255,120,120); }"
+        )
+        self._remove_btn.setVisible(False)
+        self._remove_btn.clicked.connect(
+            lambda: self.remove_clicked.emit(self._identifier_name, self._image_path)
+        )
+        lay.addWidget(self._remove_btn)
+
+    def enterEvent(self, event) -> None:
+        self._remove_btn.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._remove_btn.setVisible(False)
+        super().leaveEvent(event)
+
+
 class ManageIdentifiersDialog(_DraggableDialog):
-    """Per-database Identifier list manager. Looks and functions exactly like
-    Startup Scripts: add/edit/remove entries and reorder with ↑/↓. The order
-    shown here is the exact order the identifiers later appear in a card's
-    'Edit ID' submenu."""
+    """Per-database Identifier list manager. Add/edit/remove entries and
+    reorder with ↑/↓, same chrome as Startup Scripts. The order shown here is
+    the exact order identifiers later appear in a card's 'Edit ID' submenu.
+
+    Each row can be expanded (arrow on the left, same as a folder's) to show
+    which images currently carry that identifier - hovering a member reveals
+    a '−' to remove just that one. Editing an identifier can also flip its
+    Temporary state, which migrates every current member's membership between
+    the asset's own JSON and this Database instance's in-memory bookkeeping
+    (a LoadingOverlay is shown while that migration runs)."""
 
     _PREFS_KEY = "manage_identifiers_pos"
     W, H = 280, 340
@@ -3546,6 +3921,7 @@ class ManageIdentifiersDialog(_DraggableDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         self._identifiers: list[str] = self._db.get_identifiers() if self._db else []
+        self._expanded: set[str] = set()
 
         shadow_frame = QFrame(self)
         shadow_frame.setObjectName("dialogShadow")
@@ -3599,7 +3975,6 @@ class ManageIdentifiersDialog(_DraggableDialog):
         self._list.currentRowChanged.connect(self._on_selection_changed)
         lw_lay.addWidget(self._list)
         lay.addWidget(list_wrap, 1)
-        self._refresh_list()
 
         sep2 = QFrame()
         sep2.setObjectName("dbDialogSep")
@@ -3663,87 +4038,434 @@ class ManageIdentifiersDialog(_DraggableDialog):
         f_lay.addStretch()
         lay.addWidget(footer)
 
+        # Shown over the whole dialog while a temporary<->permanent
+        # migration is writing/stripping JSON across potentially many assets.
+        self._overlay = LoadingOverlay(frame)
+
+        self._refresh_list()
         self._restore_pos()
+
+    # ── Selection helpers ────────────────────────────────────────────────
+    # Member sub-rows are inserted as extra (non-selectable) QListWidgetItems
+    # right below their parent identifier, so `currentRow()` alone can't be
+    # trusted as an index into self._identifiers - we track selection by
+    # identifier *name* instead, tagged onto each item's UserRole data.
+
+    def _current_identifier_name(self) -> Optional[str]:
+        item = self._list.currentItem()
+
+    def _select_identifier_row(self, name: str) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            info = item.data(Qt.ItemDataRole.UserRole)
+            if info and info.get("type") == "id" and info.get("name") == name:
+                self._list.setCurrentItem(item)
+                return
+
+    # ── Member lookups / JSON migration ─────────────────────────────────
+
+    def _get_members(self, name: str) -> list[tuple[str, str]]:
+        """[(display_name, image_path), ...] for every asset currently
+        carrying identifier `name`, sorted by name."""
+        if self._db is None:
+            return []
+        if self._db.is_temporary(name):
+            paths = self._db.temp_members(name)
+            if not paths:
+                return []
+            by_path = {a["image_path"]: a for a in self._db.all_assets()}
+            out = []
+            for p in paths:
+                a = by_path.get(p)
+                nm = a["name"] if a else Path(p).stem
+                out.append((nm, p))
+            return sorted(out)
+        out = []
+        for a in self._db.all_assets():
+            try:
+                data = json.loads(a.get("json_data", "{}"))
+            except Exception:
+                data = {}
+            toks = [
+                t.strip()
+                for t in str(data.get("Identifier", "") or "").split(",")
+                if t.strip()
+            ]
+            if name in toks:
+                out.append((a["name"], a["image_path"]))
+        return sorted(out)
+
+    def _find_asset(self, image_path: str) -> Optional[dict]:
+        if self._db is None:
+            return None
+        for a in self._db.all_assets():
+            if a["image_path"] == image_path:
+                return a
+        return None
+
+    def _write_asset_json(self, asset: dict, new_text: str) -> None:
+        """Mirrors ThumbnailCard._toggle_identifier's disk+db write path."""
+        if not self._readonly:
+            json_path = asset.get("json_path", "")
+            if json_path:
+                try:
+                    Path(json_path).write_text(new_text, encoding="utf-8")
+                except Exception:
+                    pass  # best-effort; the DB copy below stays authoritative
+        if self._db:
+            self._db.update_json(asset["image_path"], new_text)
+        asset["json_data"] = new_text
+
+    def _strip_identifier_from_asset(self, name: str, image_path: str) -> None:
+        asset = self._find_asset(image_path)
+        if asset is None:
+            return
+        try:
+            data = json.loads(asset.get("json_data", "{}"))
+        except Exception:
+            data = {}
+        toks = [
+            t.strip()
+            for t in str(data.get("Identifier", "") or "").split(",")
+            if t.strip()
+        ]
+        toks = [t for t in toks if t != name]
+        if toks:
+            data["Identifier"] = ", ".join(toks)
+        else:
+            data.pop("Identifier", None)
+        self._write_asset_json(asset, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _add_identifier_to_asset(self, name: str, asset: dict) -> None:
+        try:
+            data = json.loads(asset.get("json_data", "{}"))
+        except Exception:
+            data = {}
+        toks = [
+            t.strip()
+            for t in str(data.get("Identifier", "") or "").split(",")
+            if t.strip()
+        ]
+        if name not in toks:
+            toks.append(name)
+        data["Identifier"] = ", ".join(toks)
+        self._write_asset_json(asset, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _rename_identifier_in_asset(
+        self, old_name: str, new_name: str, image_path: str
+    ) -> None:
+        """Swap old_name -> new_name in-place within one asset's Identifier
+        list, preserving its position and de-duping if new_name happens to
+        already be present separately."""
+        asset = self._find_asset(image_path)
+        if asset is None:
+            return
+        try:
+            data = json.loads(asset.get("json_data", "{}"))
+        except Exception:
+            data = {}
+        toks = [
+            t.strip()
+            for t in str(data.get("Identifier", "") or "").split(",")
+            if t.strip()
+        ]
+        toks = [new_name if t == old_name else t for t in toks]
+        deduped: list[str] = []
+        for t in toks:
+            if t not in deduped:
+                deduped.append(t)
+        if deduped:
+            data["Identifier"] = ", ".join(deduped)
+        else:
+            data.pop("Identifier", None)
+        self._write_asset_json(asset, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _remove_member(self, name: str, image_path: str) -> None:
+        if self._db is None:
+            return
+        if self._db.is_temporary(name):
+            self._db.remove_temp_member(name, image_path)
+        else:
+            self._strip_identifier_from_asset(name, image_path)
+        self._refresh_list()
+        self._select_identifier_row(name)
+
+    def _migrate_temporary(self, name: str, new_temporary: bool) -> None:
+        """Move every current member of `name` between the asset's own JSON
+        and this Database's in-memory temp set, then flip the bookkeeping
+        bit. Shows a loading overlay since this may touch many assets."""
+        if self._db is None:
+            return
+        self._overlay.set_message("Converting...")
+        self._overlay.show()
+        self._overlay.raise_()
+        QApplication.processEvents()
+        try:
+            if new_temporary:
+                # permanent -> temporary: strip from every asset's JSON
+                members = self._get_members(name)
+                paths: set[str] = set()
+                total = len(members)
+                for i, (_, image_path) in enumerate(members):
+                    self._strip_identifier_from_asset(name, image_path)
+                    paths.add(image_path)
+                    if total > 25 and i % 10 == 0:
+                        self._overlay.set_message(f"Converting... ({i}/{total})")
+                        QApplication.processEvents()
+                self._db.set_identifier_temporary(name, True, members=paths)
+            else:
+                # temporary -> permanent: write into every member's JSON
+                paths = self._db.temp_members(name)
+                by_path = {a["image_path"]: a for a in self._db.all_assets()}
+                total = len(paths)
+                for i, p in enumerate(paths):
+                    asset = by_path.get(p)
+                    if asset is not None:
+                        self._add_identifier_to_asset(name, asset)
+                    if total > 25 and i % 10 == 0:
+                        self._overlay.set_message(f"Converting... ({i}/{total})")
+                        QApplication.processEvents()
+                self._db.set_identifier_temporary(name, False)
+        finally:
+            self._overlay.hide()
+
+    def _cascade_rename(self, old_name: str, new_name: str, members: list) -> None:
+        """Rewrite `old_name` -> `new_name` inside every asset that currently
+        has it, so a rename actually propagates everywhere instead of just
+        relabeling the entry in this dialog (temporary identifiers don't need
+        this - their membership is keyed by path, not by a name copied into
+        JSON, so `Database.rename_identifier` already handles it fully)."""
+        if not members:
+            return
+        self._overlay.set_message("Renaming...")
+        self._overlay.show()
+        self._overlay.raise_()
+        QApplication.processEvents()
+        try:
+            total = len(members)
+            for i, (_, image_path) in enumerate(members):
+                self._rename_identifier_in_asset(old_name, new_name, image_path)
+                if total > 25 and i % 10 == 0:
+                    self._overlay.set_message(f"Renaming... ({i}/{total})")
+                    QApplication.processEvents()
+        finally:
+            self._overlay.hide()
+
+    def _cascade_remove(self, name: str, members: list) -> None:
+        """Strip `name` out of every asset that currently has it, so a
+        removal doesn't leave orphaned, invisible-but-still-searchable
+        entries behind in those assets' JSON."""
+        if not members:
+            return
+        self._overlay.set_message("Removing...")
+        self._overlay.show()
+        self._overlay.raise_()
+        QApplication.processEvents()
+        try:
+            total = len(members)
+            for i, (_, image_path) in enumerate(members):
+                self._strip_identifier_from_asset(name, image_path)
+                if total > 25 and i % 10 == 0:
+                    self._overlay.set_message(f"Removing... ({i}/{total})")
+                    QApplication.processEvents()
+        finally:
+            self._overlay.hide()
+
+    # ── List building ────────────────────────────────────────────────────
+
+    def _toggle_expand(self, name: str) -> None:
+        if name in self._expanded:
+            self._expanded.discard(name)
+        else:
+            self._expanded.add(name)
+        self._refresh_list()
+        self._select_identifier_row(name)
+
+    def _add_identifier_item(self, name: str) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, {"type": "id", "name": name})
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        temporary = self._db.is_temporary(name) if self._db else False
+        row_widget = _ManageIdRow(name, temporary, name in self._expanded)
+        item.setSizeHint(row_widget.sizeHint())
+        self._list.addItem(item)
+        self._list.setItemWidget(item, row_widget)
+        row_widget.arrow_clicked.connect(self._toggle_expand)
+        row_widget.row_clicked.connect(self._select_identifier_row)
+
+    def _add_member_items(self, name: str) -> None:
+        members = self._get_members(name)
+        if not members:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "empty"})
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            lbl = QLabel("No images")
+            lbl.setContentsMargins(24, 0, 0, 0)
+            lbl.setStyleSheet(
+                "color: rgba(200,200,200,0.35); font-size: 10.5px; font-style: italic;"
+                " background: transparent;"
+            )
+            item.setSizeHint(QSize(0, 20))
+            self._list.addItem(item)
+            self._list.setItemWidget(item, lbl)
+            return
+        for display_name, image_path in members:
+            item = QListWidgetItem()
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {"type": "member", "identifier": name, "image_path": image_path},
+            )
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            row_widget = _ManageMemberRow(name, display_name, image_path)
+            item.setSizeHint(row_widget.sizeHint())
+            self._list.addItem(item)
+            self._list.setItemWidget(item, row_widget)
+            row_widget.remove_clicked.connect(self._remove_member)
 
     def _persist_order(self) -> None:
         if self._db:
             self._db.set_identifiers_order(self._identifiers)
 
     def _refresh_list(self) -> None:
-        row = self._list.currentRow()
+        current_name = self._current_identifier_name()
         self._list.clear()
         for name in self._identifiers:
-            self._list.addItem(name)
-        if 0 <= row < self._list.count():
-            self._list.setCurrentRow(row)
+            self._add_identifier_item(name)
+            if name in self._expanded:
+                self._add_member_items(name)
+        if current_name and current_name in self._identifiers:
+            self._select_identifier_row(current_name)
+        self._on_selection_changed(self._list.currentRow())
 
     def _on_selection_changed(self, row: int) -> None:
-        has = row >= 0
-        count = len(self._identifiers)
+        name = self._current_identifier_name()
+        has = name is not None
         self._remove_btn.setEnabled(has)
         self._edit_btn.setEnabled(has)
-        self._up_btn.setEnabled(has and row > 0)
-        self._down_btn.setEnabled(has and row < count - 1)
+        if has:
+            idx = self._identifiers.index(name)
+            self._up_btn.setEnabled(idx > 0)
+            self._down_btn.setEnabled(idx < len(self._identifiers) - 1)
+        else:
+            self._up_btn.setEnabled(False)
+            self._down_btn.setEnabled(False)
+
+    # ── Actions ──────────────────────────────────────────────────────────
 
     def _edit_identifier(self) -> None:
-        row = self._list.currentRow()
-        if row < 0:
+        name = self._current_identifier_name()
+        if name is None:
             return
-        old_name = self._identifiers[row]
+        was_temp = self._db.is_temporary(name) if self._db else False
         dlg = AddIdentifierDialog(self)
         dlg.set_title("Edit Identifier")
-        dlg.set_text(old_name)
-        if dlg.exec():
-            new_name = dlg.identifier_text
-            self._identifiers[row] = new_name
-            if self._db:
-                self._db.rename_identifier(old_name, new_name)
-            self._refresh_list()
-            self._list.setCurrentRow(row)
+        dlg.set_text(name)
+        dlg.set_temporary(was_temp)
+        if not dlg.exec():
+            return
+        new_name = dlg.identifier_text.strip() or _default_identifier_name(
+            self._identifiers
+        )
+        new_temp = dlg.temporary
+
+        if new_name != name and self._db:
+            # A temporary identifier's membership is keyed by image path, not
+            # by this name string, so rename_identifier() below already moves
+            # it completely - no asset JSON is ever involved. A *persisted*
+            # identifier's name is literally copied into each member's JSON,
+            # so renaming it also has to rewrite every one of those copies -
+            # otherwise the old name keeps floating around as an invisible,
+            # still-searchable ghost. Grab the member list under the OLD name
+            # before renaming the table entry.
+            members = [] if was_temp else self._get_members(name)
+            self._db.rename_identifier(name, new_name)
+            if not was_temp:
+                self._cascade_rename(name, new_name, members)
+            idx = self._identifiers.index(name)
+            self._identifiers[idx] = new_name
+            if name in self._expanded:
+                self._expanded.discard(name)
+                self._expanded.add(new_name)
+
+        if new_temp != was_temp and self._db:
+            self._migrate_temporary(new_name, new_temp)
+
+        self._refresh_list()
+        self._select_identifier_row(new_name)
 
     def _add_identifier(self) -> None:
         dlg = AddIdentifierDialog(self)
-        if dlg.exec():
-            name = dlg.identifier_text
-            self._identifiers.append(name)
-            if self._db:
-                self._db.add_identifier(name)
-            self._refresh_list()
-            self._list.setCurrentRow(len(self._identifiers) - 1)
+        if not dlg.exec():
+            return
+        name = dlg.identifier_text.strip() or _default_identifier_name(
+            self._identifiers
+        )
+        self._identifiers.append(name)
+        if self._db:
+            self._db.add_identifier(name, temporary=dlg.temporary)
+        self._refresh_list()
+        self._select_identifier_row(name)
 
     def _remove_identifier(self) -> None:
-        row = self._list.currentRow()
-        if row >= 0:
-            name = self._identifiers[row]
-            del self._identifiers[row]
-            if self._db:
-                self._db.remove_identifier(name)
-            self._refresh_list()
+        name = self._current_identifier_name()
+        if name is None:
+            return
+        is_temp = self._db.is_temporary(name) if self._db else False
+        # Temporary identifiers have no JSON footprint to clean up - removing
+        # the definition already removes every membership with it.
+        members = [] if is_temp else self._get_members(name)
+        if members:
+            count = len(members)
+            resp = QMessageBox.question(
+                self,
+                "Remove Identifier",
+                f"'{name}' is currently applied to {count} image"
+                f"{'s' if count != 1 else ''}. Removing it here will also "
+                f"clear it from all of them.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        self._identifiers.remove(name)
+        self._expanded.discard(name)
+        if members:
+            self._cascade_remove(name, members)
+        if self._db:
+            self._db.remove_identifier(name)
+        self._refresh_list()
 
     def _move_up(self) -> None:
-        row = self._list.currentRow()
-        if row > 0:
-            self._identifiers[row - 1], self._identifiers[row] = (
-                self._identifiers[row],
-                self._identifiers[row - 1],
+        name = self._current_identifier_name()
+        if name is None:
+            return
+        idx = self._identifiers.index(name)
+        if idx > 0:
+            self._identifiers[idx - 1], self._identifiers[idx] = (
+                self._identifiers[idx],
+                self._identifiers[idx - 1],
             )
             self._persist_order()
             self._refresh_list()
-            self._list.setCurrentRow(row - 1)
+            self._select_identifier_row(name)
 
     def _move_down(self) -> None:
-        row = self._list.currentRow()
-        if row < len(self._identifiers) - 1:
-            self._identifiers[row], self._identifiers[row + 1] = (
-                self._identifiers[row + 1],
-                self._identifiers[row],
+        name = self._current_identifier_name()
+        if name is None:
+            return
+        idx = self._identifiers.index(name)
+        if idx < len(self._identifiers) - 1:
+            self._identifiers[idx + 1], self._identifiers[idx] = (
+                self._identifiers[idx],
+                self._identifiers[idx + 1],
             )
             self._persist_order()
             self._refresh_list()
-            self._list.setCurrentRow(row + 1)
+            self._select_identifier_row(name)
 
 
 # ── Image Viewer Overlay ───────────────────────────────────────────────────────
+
 
 
 class ImgViewerOverlay(QWidget):
