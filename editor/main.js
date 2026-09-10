@@ -71,11 +71,9 @@ function yieldToEventLoop() {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-// Shared by the dialog-based "Open Folder" button and by drag-and-drop of a
-// folder from the OS file explorer. Reads every image directly inside `dir`
-// (non-recursive, matching the old behavior) and returns lightweight entries
-// — {name, path, w, h, thumbDataUrl} — instead of the full-resolution file
-// bytes.
+// Reads every image directly inside `dir` — one directory, non-recursive —
+// and returns lightweight entries — {name, path, w, h, thumbDataUrl} —
+// instead of the full-resolution file bytes.
 //
 // This used to fs.readFileSync + base64-encode the FULL file for every image
 // up front, all in one synchronous pass, and hand the entire batch back to
@@ -87,7 +85,7 @@ function yieldToEventLoop() {
 // nativeImage decoder/resizer, so no giant intermediate buffers), and the
 // renderer fetches a given image's real bytes lazily, one at a time, only
 // once it's actually opened or edited (see 'read-image-full' below).
-async function readImagesFromDir(dir) {
+async function readImagesInSingleDir(dir) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -112,6 +110,40 @@ async function readImagesFromDir(dir) {
       images.push({ name, path: filePath, w: width, h: height, thumbDataUrl: thumb.toDataURL() });
     } catch (e) { /* skip unreadable file */ }
     if (i % YIELD_EVERY === 0) await yieldToEventLoop();
+  }
+  return images;
+}
+
+// Shared by the dialog-based "Open Folder" button and by drag-and-drop of a
+// folder from the OS file explorer. Reads images out of `dir` two layers
+// deep: every image directly inside `dir` (first layer), followed by every
+// image directly inside each of `dir`'s immediate subfolders (second layer,
+// subfolders walked in name order) — but no deeper than that. The two
+// layers are simply concatenated in that order into one flat list, so a
+// dropped folder full of subfolders still becomes a single category, with
+// its images ordered first-layer, then first subfolder, then second
+// subfolder, etc. Each returned entry still carries the image's real,
+// original absolute `path` on disk (from readImagesInSingleDir), so saving
+// later writes back to wherever the file actually lives — the merging here
+// is purely an in-app grouping and never moves anything on disk.
+async function readImagesFromDir(dir) {
+  const firstLayer = await readImagesInSingleDir(dir);
+  if (firstLayer === null) return null; // dir itself unreadable/missing
+
+  let subdirNames;
+  try {
+    subdirNames = fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory())
+      .map(e => e.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  } catch (e) {
+    subdirNames = [];
+  }
+
+  let images = firstLayer;
+  for (const subName of subdirNames) {
+    const subImages = await readImagesInSingleDir(path.join(dir, subName));
+    if (subImages && subImages.length) images = images.concat(subImages);
   }
   return images;
 }
