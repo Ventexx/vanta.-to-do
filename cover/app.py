@@ -162,8 +162,24 @@ class ComfyAPI:
         self.client_id = str(uuid.uuid4())
 
     def upload_image(self, filepath, dest_filename=None):
+        # IMPORTANT: never fall back to the local file's own basename here.
+        # We upload with overwrite=true (so re-running a workflow doesn't
+        # pile up stale files on the server), and ComfyUI's /upload/image
+        # honors that literally: if two *different* local files happen to
+        # share a filename (e.g. "base_1.png" from two different source
+        # folders -- very common with generic/incrementing generator
+        # output names), the second upload silently overwrites the first
+        # on disk. Since all of a run's uploads happen before the prompt
+        # is queued, every LoadImage node that ended up pointing at that
+        # shared name then reads whichever file was uploaded *last* --
+        # not the distinct image the user actually assigned to that slot.
+        # A per-upload UUID name sidesteps the collision entirely,
+        # regardless of what the source files are called.
+        if not dest_filename:
+            ext = os.path.splitext(filepath)[1]
+            dest_filename = f"{uuid.uuid4().hex}{ext}"
         with open(filepath, "rb") as f:
-            files = {"image": (dest_filename or os.path.basename(filepath), f)}
+            files = {"image": (dest_filename, f)}
             data = {"overwrite": "true"}
             r = requests.post(f"{self.server}/upload/image", files=files, data=data, timeout=60)
         r.raise_for_status()
@@ -5767,6 +5783,18 @@ def apply_style(app: QApplication) -> None:
 
 
 def main():
+    if _IS_WINDOWS:
+        # Without this, Windows groups the taskbar entry under python.exe's
+        # own AppUserModelID and shows the Python icon instead of ours, no
+        # matter what setWindowIcon() is called with. Must run before the
+        # QApplication (and thus the first window) is created.
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "vael.cover.app.1"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     apply_style(app)
     win = MainWindow()
